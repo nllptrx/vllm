@@ -1,0 +1,11 @@
+# Reproducible deployment overlay for the v0.25.1 image used by OfficeGenius.
+# The scheduler is pure Python, so replacing this module is equivalent to a
+# source build while retaining the base image's compiled CUDA extensions.
+FROM vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089
+
+COPY vllm/v1/core/sched/scheduler.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/core/sched/scheduler.py
+
+LABEL org.opencontainers.image.source="https://github.com/nllptrx/vllm"
+LABEL org.opencontainers.image.revision="83f19b358"
+LABEL org.opencontainers.image.description="vLLM 0.25.1 with multimodal APC Mamba zero-collapse deadlock fix"
