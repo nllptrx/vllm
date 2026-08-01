@@ -221,3 +221,40 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+@pytest.mark.parametrize("include_prefill", [False, True])
+def test_non_spec_step_recovers_accepted_state_with_mixed_prefill(
+    include_prefill: bool,
+):
+    """A post-verification decode must recover the accepted GDN state.
+
+    The scheduler can mix that decode with a fresh/chunked prefill.  Prefills
+    must keep a zero convolution offset while the decode reads the state left
+    by its last accepted speculative token.
+    """
+    builder = _create_gdn_builder(num_speculative_tokens=3)
+    seq_lens = [65]
+    query_lens = [1]
+    if include_prefill:
+        seq_lens.append(32)
+        query_lens.append(16)
+    batch = BatchSpec(seq_lens=seq_lens, query_lens=query_lens)
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE, arange_block_indices=True
+    )
+    accepted = torch.tensor([3, 1][: batch.batch_size], dtype=torch.int32)
+
+    meta = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        num_decode_draft_tokens_cpu=None,
+    )
+
+    assert meta.spec_decode_src_indices is not None
+    assert meta.non_spec_state_indices_tensor is not None
+    assert meta.spec_decode_src_indices.tolist() == [2]
+    assert meta.non_spec_state_indices_tensor[0].item() == 0
+    assert meta.num_accepted_tokens is not None
+    assert meta.num_accepted_tokens.tolist() == [3] + ([1] if include_prefill else [])

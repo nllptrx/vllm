@@ -1,0 +1,17 @@
+# Experimental v0.25.1 image for validating n-gram speculative decoding on
+# hybrid GDN models. All copied modules are Python/Triton sources, so the base
+# image's compiled CUDA extensions remain reusable.
+FROM nllptrx/vllm-openai:0.25.1-apc-fix
+
+COPY vllm/v1/attention/backends/gdn_attn.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/attention/backends/gdn_attn.py
+COPY vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py
+COPY vllm/model_executor/layers/mamba/ops/causal_conv1d.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
+COPY vllm/v1/worker/gpu_model_runner.py \
+    /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_model_runner.py
+
+LABEL org.opencontainers.image.source="https://github.com/nllptrx/vllm"
+LABEL org.opencontainers.image.revision="c29ca66ec015b1ebcf099e60056c2571ff2b9dca"
+LABEL org.opencontainers.image.description="vLLM 0.25.1 APC fix plus experimental Qwen GDN n-gram state recovery"
