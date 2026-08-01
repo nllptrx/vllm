@@ -369,8 +369,16 @@ class Scheduler(SchedulerInterface):
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:
-                # align to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
+                # Align to block_size when possible. Encoder-cache contention
+                # between adjacent multimodal inputs can leave a positive gap
+                # smaller than one block. Rounding that gap to zero makes the
+                # scheduler skip the request forever while it still reports the
+                # request as running. Keep the sub-block chunk so the request
+                # makes progress; its Mamba state is simply not cached, which is
+                # the documented exception above.
+                aligned = num_new_tokens // block_size * block_size
+                if aligned > 0:
+                    num_new_tokens = aligned
             elif (
                 num_computed_tokens
                 < last_cache_position
@@ -390,7 +398,9 @@ class Scheduler(SchedulerInterface):
             ):
                 num_new_tokens = num_uncached_common_prefix_tokens
                 # keep alignment to block_size
-                num_new_tokens = num_new_tokens // block_size * block_size
+                aligned = num_new_tokens // block_size * block_size
+                if aligned > 0:
+                    num_new_tokens = aligned
         return num_new_tokens
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
