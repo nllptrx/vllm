@@ -30,6 +30,10 @@ from vllm.model_executor.layers.fla.ops import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from vllm.model_executor.layers.fla.ops.chunk import l2norm_fwd
+from vllm.model_executor.layers.fla.ops.index import (
+    prepare_chunk_indices,
+    prepare_chunk_offsets,
+)
 from vllm.model_executor.layers.fla.ops.utils import FLA_CHUNK_SIZE
 from vllm.model_executor.layers.layernorm import RMSNormGated
 from vllm.model_executor.layers.linear import (
@@ -174,6 +178,9 @@ def _resolve_gdn_prefill_backend(
     backend = str(backend_cfg).strip().lower()
 
     if not current_platform.is_cuda():
+        return backend, "triton"
+
+    if envs.VLLM_BATCH_INVARIANT:
         return backend, "triton"
 
     head_k_dim = getattr(
@@ -418,6 +425,9 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+    supports_batch_invariant: bool = True
+    _bi_decode_cu: torch.Tensor | None = None
+
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -920,8 +930,20 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-        ba, _ = self.in_proj_ba(hidden_states)
+        bi_segments = self._bi_segments(num_tokens)
+        if bi_segments is not None:
+            mixed_qkvz = torch.cat(
+                [self.in_proj_qkvz(hidden_states[s:e])[0] for s, e in bi_segments],
+                dim=0,
+            )
+            ba = torch.cat(
+                [self.in_proj_ba(hidden_states[s:e])[0] for s, e in bi_segments],
+                dim=0,
+            )
+            assert mixed_qkvz.size(0) == num_tokens
+        else:
+            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
+            ba, _ = self.in_proj_ba(hidden_states)
 
         if self.gqa_interleaved_layout:
             # Qwen3-Next: unpack the interleaved GQA layout
@@ -1257,6 +1279,65 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out=core_attn_out,
         )
 
+    def _bi_segments(self, num_tokens: int) -> list[tuple[int, int]] | None:
+        """Token span of every request of the step, plus the padded tail.
+
+        None when batch invariance is off or the step carries no GDN metadata.
+        """
+        if not envs.VLLM_BATCH_INVARIANT or num_tokens <= 1:
+            return None
+        raw = get_forward_context().attn_metadata
+        if not isinstance(raw, dict) or self.prefix not in raw:
+            return None
+        meta = raw[self.prefix]
+        if not isinstance(meta, GDNAttentionMetadata):
+            return None
+        cu = meta.non_spec_query_start_loc_cpu
+        if cu is None:
+            return None
+        segments = [(cu[i], cu[i + 1]) for i in range(len(cu) - 1)]
+        if cu[-1] < num_tokens:
+            segments.append((cu[-1], num_tokens))
+        return [(start, end) for start, end in segments if end > start]
+
+    def _bi_decode_recurrence(
+        self,
+        *,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        ssm_state: torch.Tensor,
+        state_indices: torch.Tensor,
+        num_decodes: int,
+    ):
+        """Decode recurrence run one request at a time, so a request never
+        shares a kernel call with its neighbours."""
+        if self._bi_decode_cu is None or self._bi_decode_cu.device != q.device:
+            self._bi_decode_cu = torch.tensor(
+                [0, 1], dtype=torch.int32, device=q.device
+            )
+        outs = []
+        last = None
+        for i in range(num_decodes):
+            out_i, last = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                a=a[i : i + 1],
+                b=b[i : i + 1],
+                dt_bias=self.dt_bias,
+                q=q[:, i : i + 1],
+                k=k[:, i : i + 1],
+                v=v[:, i : i + 1],
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=self._bi_decode_cu,
+                ssm_state_indices=state_indices[i : i + 1],
+                use_qk_l2norm_in_kernel=True,
+            )
+            outs.append(out_i)
+        return torch.cat(outs, dim=1), last
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -1288,6 +1369,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
+            and not envs.VLLM_BATCH_INVARIANT
         ):
             return self._forward_core_decode_non_spec(
                 mixed_qkv=mixed_qkv,
@@ -1362,30 +1444,103 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
             #   pointed to by "state_indices_tensor"
-            mixed_qkv_non_spec = causal_conv1d_fn(
-                mixed_qkv_non_spec_T,
-                conv_weights,
-                self.conv1d.bias,
-                activation=self.activation,
-                conv_states=conv_state,
-                has_initial_state=has_initial_state,
-                cache_indices=non_spec_state_indices_tensor,
-                query_start_loc=non_spec_query_start_loc,
-                metadata=attn_metadata,
-            ).transpose(0, 1)
+            if envs.VLLM_BATCH_INVARIANT:
+                cu_list = attn_metadata.non_spec_query_start_loc_cpu
+                assert cu_list is not None
+                conv_chunks = []
+                for seq in range(len(cu_list) - 1):
+                    seq_start, seq_end = cu_list[seq], cu_list[seq + 1]
+                    seq_has_initial = (
+                        has_initial_state[seq : seq + 1]
+                        if has_initial_state is not None
+                        else None
+                    )
+                    seq_cache = non_spec_state_indices_tensor[seq : seq + 1]  # type: ignore[index]
+                    if (
+                        seq_end - seq_start == 1
+                        and seq_has_initial is not None
+                        and bool(seq_has_initial[0])
+                    ):
+                        conv_chunks.append(
+                            causal_conv1d_update(
+                                mixed_qkv_non_spec_T[:, seq_start:seq_end].transpose(
+                                    0, 1
+                                ),
+                                conv_state,
+                                conv_weights,
+                                self.conv1d.bias,
+                                self.activation,
+                                conv_state_indices=seq_cache,
+                                validate_data=False,
+                            )
+                        )
+                        continue
+                    conv_chunks.append(
+                        causal_conv1d_fn(
+                            mixed_qkv_non_spec_T[:, seq_start:seq_end],
+                            conv_weights,
+                            self.conv1d.bias,
+                            activation=self.activation,
+                            conv_states=conv_state,
+                            has_initial_state=seq_has_initial,
+                            cache_indices=seq_cache,
+                            query_start_loc=torch.tensor(
+                                [0, seq_end - seq_start],
+                                dtype=torch.int32,
+                                device=mixed_qkv_non_spec_T.device,
+                            ),
+                        ).transpose(0, 1)
+                    )
+                if cu_list[-1] < mixed_qkv_non_spec_T.size(1):
+                    conv_chunks.append(
+                        mixed_qkv_non_spec_T[:, cu_list[-1] :].transpose(0, 1)
+                    )
+                mixed_qkv_non_spec = torch.cat(conv_chunks, dim=0)
+            else:
+                mixed_qkv_non_spec = causal_conv1d_fn(
+                    mixed_qkv_non_spec_T,
+                    conv_weights,
+                    self.conv1d.bias,
+                    activation=self.activation,
+                    conv_states=conv_state,
+                    has_initial_state=has_initial_state,
+                    cache_indices=non_spec_state_indices_tensor,
+                    query_start_loc=non_spec_query_start_loc,
+                    metadata=attn_metadata,
+                ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
-            mixed_qkv_non_spec = causal_conv1d_update(
-                mixed_qkv_non_spec,
-                conv_state,
-                conv_weights,
-                self.conv1d.bias,
-                self.activation,
-                conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+            if envs.VLLM_BATCH_INVARIANT:
+                decode_conv_indices = non_spec_state_indices_tensor[  # type: ignore[index]
                     : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
-                ],
-                validate_data=True,
-            )
+                ]
+                mixed_qkv_non_spec = torch.cat(
+                    [
+                        causal_conv1d_update(
+                            mixed_qkv_non_spec[i : i + 1],
+                            conv_state,
+                            conv_weights,
+                            self.conv1d.bias,
+                            self.activation,
+                            conv_state_indices=decode_conv_indices[i : i + 1],
+                            validate_data=False,
+                        )
+                        for i in range(attn_metadata.num_decodes)
+                    ],
+                    dim=0,
+                )
+            else:
+                mixed_qkv_non_spec = causal_conv1d_update(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                        : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
+                    ],
+                    validate_data=True,
+                )
         else:
             mixed_qkv_non_spec = None
 
@@ -1481,22 +1636,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
             )
-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=a[:num_decode_tokens],
-                b=b[:num_decode_tokens],
-                dt_bias=self.dt_bias,
-                q=query_decode,
-                k=key_decode,
-                v=value_decode,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                    : attn_metadata.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if envs.VLLM_BATCH_INVARIANT:
+                core_attn_out_decode, _ = self._bi_decode_recurrence(
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    q=query_decode,
+                    k=key_decode,
+                    v=value_decode,
+                    ssm_state=ssm_state,
+                    state_indices=non_spec_state_indices_tensor,  # type: ignore[arg-type]
+                    num_decodes=attn_metadata.num_decodes,
+                )
+            else:
+                core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    dt_bias=self.dt_bias,
+                    q=query_decode,
+                    k=key_decode,
+                    v=value_decode,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
             core_attn_out_decode = None
 
@@ -1512,22 +1679,52 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             assert prefill_has_initial_state is not None
             initial_state = ssm_state[prefill_state_indices]
             initial_state[~prefill_has_initial_state, ...] = 0
-            (
-                core_attn_out_non_spec,
-                last_recurrent_state,
-            ) = self.chunk_gated_delta_rule(
-                q=query_non_spec,
-                k=key_non_spec,
-                v=value_non_spec,
-                g=g_non_spec,
-                beta=beta_non_spec,
-                initial_state=initial_state,
-                output_final_state=True,
-                cu_seqlens=attn_metadata.prefill_query_start_loc,
-                chunk_indices=attn_metadata.chunk_indices,
-                chunk_offsets=attn_metadata.chunk_offsets,
-                use_qk_l2norm_in_kernel=False,
-            )
+            if envs.VLLM_BATCH_INVARIANT:
+                prefill_cu = attn_metadata.prefill_query_start_loc_cpu
+                assert prefill_cu is not None
+                prefill_outputs = []
+                prefill_states = []
+                for seq in range(attn_metadata.num_prefills):
+                    seq_start, seq_end = prefill_cu[seq], prefill_cu[seq + 1]
+                    seq_cu = torch.tensor([0, seq_end - seq_start], dtype=torch.int32)
+                    seq_out, seq_state = self.chunk_gated_delta_rule(
+                        q=query_non_spec[:, seq_start:seq_end],
+                        k=key_non_spec[:, seq_start:seq_end],
+                        v=value_non_spec[:, seq_start:seq_end],
+                        g=g_non_spec[:, seq_start:seq_end],
+                        beta=beta_non_spec[:, seq_start:seq_end],
+                        initial_state=initial_state[seq : seq + 1],
+                        output_final_state=True,
+                        cu_seqlens=seq_cu.to(query_non_spec.device),
+                        chunk_indices=prepare_chunk_indices(seq_cu, FLA_CHUNK_SIZE).to(
+                            query_non_spec.device
+                        ),
+                        chunk_offsets=prepare_chunk_offsets(seq_cu, FLA_CHUNK_SIZE).to(
+                            query_non_spec.device
+                        ),
+                        use_qk_l2norm_in_kernel=False,
+                    )
+                    prefill_outputs.append(seq_out)
+                    prefill_states.append(seq_state)
+                core_attn_out_non_spec = torch.cat(prefill_outputs, dim=1)
+                last_recurrent_state = torch.cat(prefill_states, dim=0)
+            else:
+                (
+                    core_attn_out_non_spec,
+                    last_recurrent_state,
+                ) = self.chunk_gated_delta_rule(
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    g=g_non_spec,
+                    beta=beta_non_spec,
+                    initial_state=initial_state,
+                    output_final_state=True,
+                    cu_seqlens=attn_metadata.prefill_query_start_loc,
+                    chunk_indices=attn_metadata.chunk_indices,
+                    chunk_offsets=attn_metadata.chunk_offsets,
+                    use_qk_l2norm_in_kernel=False,
+                )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
 
@@ -1537,6 +1734,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec], dim=1
                 )
+        elif attn_metadata.num_decodes > 0 and envs.VLLM_BATCH_INVARIANT:
+            core_attn_out_non_spec, last_recurrent_state = self._bi_decode_recurrence(
+                a=a,
+                b=b,
+                q=query_non_spec,
+                k=key_non_spec,
+                v=value_non_spec,
+                ssm_state=ssm_state,
+                state_indices=non_spec_state_indices_tensor,  # type: ignore[arg-type]
+                num_decodes=attn_metadata.num_decodes,
+            )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(

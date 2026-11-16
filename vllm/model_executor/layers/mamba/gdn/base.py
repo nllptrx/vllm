@@ -3,6 +3,7 @@
 import torch
 from transformers import PretrainedConfig
 
+from vllm import envs
 from vllm.config import (
     VllmConfig,
 )
@@ -21,6 +22,8 @@ from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 class GatedDeltaNetAttention(PluggableLayer, MambaBase):
     """Base class for GatedDeltaNet attention layer."""
+
+    supports_batch_invariant: bool = False
 
     def __init__(
         self,
@@ -45,6 +48,17 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             if self.speculative_config
             else 0
         )
+        if envs.VLLM_BATCH_INVARIANT:
+            if not self.supports_batch_invariant:
+                raise NotImplementedError(
+                    "VLLM_BATCH_INVARIANT=1 is not supported for "
+                    f"{type(self).__name__}."
+                )
+            if self.num_spec > 0:
+                raise NotImplementedError(
+                    "VLLM_BATCH_INVARIANT=1 is not supported together with "
+                    "speculative decoding on GDN_ATTN."
+                )
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
