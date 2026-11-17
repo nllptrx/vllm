@@ -152,6 +152,15 @@ class GemmaRMSNorm(CustomOp):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """PyTorch-native implementation equivalent to forward()."""
         weight = self.weight.float() + 1.0
+        if envs.VLLM_BATCH_INVARIANT and x.is_cuda:
+            if residual is None:
+                return rms_norm_batch_invariant(x, weight, self.variance_epsilon)
+            dtype = x.dtype
+            x = x.float() + residual.float()
+            residual = x.to(dtype)
+            output = rms_norm_batch_invariant(x, weight, self.variance_epsilon)
+            assert isinstance(output, torch.Tensor)
+            return output.to(dtype), residual
         if residual is None:
             return ir.ops.rms_norm(x, weight, self.variance_epsilon)
         return ir.ops.fused_add_rms_norm(x, residual, weight, self.variance_epsilon)
