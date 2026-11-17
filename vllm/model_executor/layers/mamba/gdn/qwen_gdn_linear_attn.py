@@ -26,6 +26,7 @@ from vllm.model_executor.layers.fla.ops import (
 )
 from vllm.model_executor.layers.fla.ops import (
     fused_post_conv_prep,
+    fused_recurrent_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_sigmoid_gating_delta_rule_update,
 )
@@ -1543,6 +1544,47 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 )
         else:
             mixed_qkv_non_spec = None
+
+        if envs.VLLM_BATCH_INVARIANT:
+            assert mixed_qkv_non_spec is not None
+            assert non_spec_state_indices_tensor is not None
+            assert non_spec_query_start_loc is not None
+            indices = non_spec_state_indices_tensor
+            if has_initial_state is not None:
+                initial = ssm_state[indices]
+                ssm_state[indices] = torch.where(
+                    has_initial_state[:, None, None, None], initial, 0
+                )
+            q, k, v, g, beta = fused_post_conv_prep(
+                conv_output=mixed_qkv_non_spec,
+                a=a,
+                b=b,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                num_k_heads=self.num_k_heads // self.tp_size,
+                head_k_dim=self.head_k_dim,
+                head_v_dim=self.head_v_dim,
+                apply_l2norm=False,
+                output_g_exp=False,
+            )
+            # Every token updates its request's persistent state slot.
+            repeated_indices = (
+                indices[:, None].expand(-1, max(1, num_actual_tokens)).contiguous()
+            )
+            output, _ = fused_recurrent_gated_delta_rule(
+                q=q.unsqueeze(0),
+                k=k.unsqueeze(0),
+                v=v.unsqueeze(0),
+                g=g.unsqueeze(0),
+                beta=beta.unsqueeze(0),
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=non_spec_query_start_loc,
+                ssm_state_indices=repeated_indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            core_attn_out[:num_actual_tokens] = output.squeeze(0)
+            return
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
 
